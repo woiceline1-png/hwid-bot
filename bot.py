@@ -7,28 +7,34 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
 import json
+import sys
 
 # ===== KONFIGURASI =====
-TOKEN = os.environ.get("DISCORD_TOKEN")  # Ambil dari environment variable
+TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
-    raise ValueError("DISCORD_TOKEN tidak ditemukan di environment variable!")
+    print("❌ DISCORD_TOKEN tidak ditemukan di environment variable!")
+    sys.exit(1)
 
 DATABASE_FILE = "hwid.db"
 API_PORT = int(os.environ.get("PORT", 5000))
 
 # ===== DATABASE =====
 async def init_db():
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                discord_id INTEGER PRIMARY KEY,
-                username TEXT,
-                hwid TEXT UNIQUE,
-                verified INTEGER DEFAULT 0,
-                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    discord_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    hwid TEXT UNIQUE,
+                    verified INTEGER DEFAULT 0,
+                    verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+            print("✅ Database initialized")
+    except Exception as e:
+        print(f"❌ Database error: {e}")
 
 # ===== DISCORD BOT =====
 intents = discord.Intents.default()
@@ -40,6 +46,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     await init_db()
     print(f'✅ Bot ready! Logged in as {bot.user}')
+    print(f'✅ Bot is in {len(bot.guilds)} guilds')
 
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
@@ -134,6 +141,10 @@ async def my_hwid(ctx):
 app = Flask(__name__)
 CORS(app)
 
+@app.route('/')
+def home():
+    return "✅ Bot is running on Railway!"
+
 @app.route('/verify', methods=['GET'])
 def verify_hwid_api():
     hwid = request.args.get('hwid')
@@ -170,10 +181,17 @@ def get_user_from_hwid():
 
 def run_api():
     port = int(os.environ.get("PORT", 5000))
+    print(f"🌐 Starting Flask API on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ===== RUN =====
 if __name__ == "__main__":
+    print("🚀 Starting HWID Bot...")
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
-    bot.run(TOKEN)
+    print("✅ API thread started")
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
+        sys.exit(1)
