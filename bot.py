@@ -16,7 +16,7 @@ if not TOKEN:
     sys.exit(1)
 
 DATABASE_FILE = "hwid.db"
-API_PORT = int(os.environ.get("PORT", 5000))
+API_PORT = int(os.environ.get("PORT", 8080))
 
 # ===== DATABASE =====
 async def init_db():
@@ -180,7 +180,7 @@ def get_user_from_hwid():
         return jsonify({"error": "User not found or not verified"}), 404
 
 def run_api():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     print(f"🌐 Starting Flask API on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
