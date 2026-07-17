@@ -305,6 +305,40 @@ async def my_hwid(ctx):
         else:
             await ctx.send("❌ No HWID registered for you yet. Contact admin to verify.")
 
+@bot.command(name='cleardm')
+@commands.has_permissions(administrator=True)
+async def clear_dm(ctx, member: discord.Member):
+    """Menghapus semua pesan bot di DM seorang user (maks 100 pesan terakhir)."""
+    dm_channel = member.dm_channel
+    if dm_channel is None:
+        # Jika bot belum pernah DM user ini, buat channel DM-nya
+        dm_channel = await member.create_dm()
+    
+    await ctx.send(f"🧹 Sedang membersihkan DM bot dengan {member.display_name}...")
+    
+    deleted_count = 0
+    try:
+        # Ambil 100 pesan terakhir di DM
+        async for message in dm_channel.history(limit=100):
+            # Hanya hapus pesan yang dikirim oleh bot
+            if message.author == bot.user:
+                try:
+                    await message.delete()
+                    deleted_count += 1
+                    # Delay sedikit agar tidak kena rate-limit Discord (5 detik per 5 delete)
+                    await asyncio.sleep(1)
+                except discord.Forbidden:
+                    await ctx.send("❌ Bot tidak punya izin menghapus pesan di DM tersebut.")
+                    break
+                except discord.HTTPException:
+                    pass # Abaikan jika ada error kecil
+                
+        await ctx.send(f"✅ Berhasil menghapus **{deleted_count}** pesan bot di DM {member.display_name}.")
+    except discord.Forbidden:
+        await ctx.send(f"❌ Gagal mengakses DM {member.display_name}. Bot tidak bisa membuka DM-nya.")
+    except Exception as e:
+        await ctx.send(f"❌ Terjadi error: {str(e)}")
+
 # ===== FLASK API =====
 app = Flask(__name__)
 CORS(app)
