@@ -2,3 +2,4 @@ discord.py
 aiosqlite
 Flask
 flask-cors
+PyNaCl
