@@ -107,10 +107,23 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
 
-    expiry_date = datetime.utcnow() + timedelta(days=expiry_days)
-    expiry_str = expiry_date.isoformat()
-
     async with aiosqlite.connect(DATABASE_FILE) as db:
+        # === CEK ANTI DOBEL DM MAKSIMAL ===
+        # Cek apakah user ini SUDAH diverifikasi (status verified = 1)
+        cursor = await db.execute(
+            'SELECT verified, hwid FROM users WHERE discord_id = ?',
+            (member.id,)
+        )
+        row = await cursor.fetchone()
+        
+        if row and row[0] == 1:
+            if row[1] == hwid:
+                await ctx.send(f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID tersebut. Tidak ada perubahan.")
+            else:
+                await ctx.send(f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID berbeda. Gunakan `!unverifyhwid` dulu jika ingin mengganti HWID.")
+            return # <- Bot akan berhenti di sini, TIDAK mengirim DM lagi
+
+        # Cek apakah HWID dipakai user lain
         cursor = await db.execute(
             'SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?',
             (hwid, member.id)
@@ -119,6 +132,9 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
         if existing:
             await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
             return
+
+        expiry_date = datetime.utcnow() + timedelta(days=expiry_days)
+        expiry_str = expiry_date.isoformat()
 
         await db.execute('''
             INSERT INTO users (discord_id, username, hwid, verified, expiry_date)
