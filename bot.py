@@ -17,6 +17,10 @@ if not TOKEN:
 DATABASE_FILE = "hwid.db"
 API_PORT = int(os.environ.get("PORT", 5000))
 
+# Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
+def get_wib_time():
+    return datetime.utcnow() + timedelta(hours=7)
+
 # ===== DATABASE =====
 async def init_db():
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -30,7 +34,6 @@ async def init_db():
                 expiry_date TIMESTAMP
             )
         ''')
-        # Migration: tambah kolom expiry_date jika belum ada
         try:
             await db.execute('ALTER TABLE users ADD COLUMN expiry_date TIMESTAMP')
         except:
@@ -61,12 +64,12 @@ async def check_hwid(ctx, member: discord.Member = None):
         row = await cursor.fetchone()
         if row:
             hwid, verified, verified_at, expiry_date = row
-            now_utc = datetime.utcnow()
+            now_wib = get_wib_time()
             expired = False
             if expiry_date:
                 try:
                     exp_dt = datetime.fromisoformat(expiry_date)
-                    if now_utc > exp_dt:
+                    if now_wib > exp_dt:
                         expired = True
                 except:
                     pass
@@ -83,11 +86,15 @@ async def check_hwid(ctx, member: discord.Member = None):
                 inline=True
             )
             embed.add_field(name="Verified At", value=verified_at or "Never", inline=True)
-            embed.add_field(
-                name="Expiry Date",
-                value=expiry_date or "Not set",
-                inline=False
-            )
+            
+            exp_display = "Not set"
+            if expiry_date:
+                try:
+                    exp_display = datetime.fromisoformat(expiry_date).strftime('%Y-%m-%d %H:%M WIB')
+                except:
+                    exp_display = expiry_date
+            
+            embed.add_field(name="Expiry Date", value=exp_display, inline=False)
             embed.add_field(
                 name="Status",
                 value="⏰ EXPIRED" if expired else "🟢 Active",
@@ -109,7 +116,6 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
         # === CEK ANTI DOBEL DM MAKSIMAL ===
-        # Cek apakah user ini SUDAH diverifikasi (status verified = 1)
         cursor = await db.execute(
             'SELECT verified, hwid FROM users WHERE discord_id = ?',
             (member.id,)
@@ -121,9 +127,8 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
                 await ctx.send(f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID tersebut. Tidak ada perubahan.")
             else:
                 await ctx.send(f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID berbeda. Gunakan `!unverifyhwid` dulu jika ingin mengganti HWID.")
-            return # <- Bot akan berhenti di sini, TIDAK mengirim DM lagi
+            return
 
-        # Cek apakah HWID dipakai user lain
         cursor = await db.execute(
             'SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?',
             (hwid, member.id)
@@ -133,7 +138,8 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
             await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
             return
 
-        expiry_date = datetime.utcnow() + timedelta(days=expiry_days)
+        # Hitung waktu WIB
+        expiry_date = get_wib_time() + timedelta(days=expiry_days)
         expiry_str = expiry_date.isoformat()
 
         await db.execute('''
@@ -150,7 +156,7 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
         try:
             await member.send(
                 f"✅ HWID Anda `{hwid}` telah diverifikasi!\n"
-                f"⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+                f"⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n"
                 f"⏳ Durasi: **{expiry_days} hari**"
             )
         except discord.Forbidden:
@@ -159,7 +165,7 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
         await ctx.send(
             f"✅ HWID `{hwid}` verified for {member.display_name}!\n"
             f"⏰ Expiry: **{expiry_days} days** "
-            f"({expiry_date.strftime('%Y-%m-%d %H:%M UTC')})"
+            f"({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})"
         )
 
 @bot.command(name='extendhwid')
@@ -181,16 +187,17 @@ async def extend_hwid(ctx, member: discord.Member, additional_days: int):
             return
 
         current_expiry_str, verified = row
+        now_wib = get_wib_time()
+        
         if current_expiry_str:
             try:
                 current_expiry = datetime.fromisoformat(current_expiry_str)
-                # Jika sudah expired, hitung dari now
-                if current_expiry < datetime.utcnow():
-                    current_expiry = datetime.utcnow()
+                if current_expiry < now_wib:
+                    current_expiry = now_wib
             except:
-                current_expiry = datetime.utcnow()
+                current_expiry = now_wib
         else:
-            current_expiry = datetime.utcnow()
+            current_expiry = now_wib
 
         new_expiry = current_expiry + timedelta(days=additional_days)
         await db.execute(
@@ -201,7 +208,7 @@ async def extend_hwid(ctx, member: discord.Member, additional_days: int):
 
         await ctx.send(
             f"✅ Extended {member.display_name}'s expiry by **{additional_days} days**!\n"
-            f"🆕 New expiry: `{new_expiry.strftime('%Y-%m-%d %H:%M UTC')}`"
+            f"🆕 New expiry: `{new_expiry.strftime('%Y-%m-%d %H:%M WIB')}`"
         )
 
 @bot.command(name='unverifyhwid')
@@ -224,7 +231,7 @@ async def list_hwid(ctx):
             await ctx.send("No verified users found.")
             return
 
-        now_utc = datetime.utcnow()
+        now_wib = get_wib_time()
         embed = discord.Embed(
             title=f"Verified Users ({len(rows)})",
             color=discord.Color.green()
@@ -232,16 +239,19 @@ async def list_hwid(ctx):
         for row in rows[:10]:
             discord_id, username, hwid, verified_at, expiry_date = row
             expired = False
+            exp_display = "N/A"
             if expiry_date:
                 try:
-                    if now_utc > datetime.fromisoformat(expiry_date):
+                    exp_dt = datetime.fromisoformat(expiry_date)
+                    if now_wib > exp_dt:
                         expired = True
+                    exp_display = exp_dt.strftime('%Y-%m-%d %H:%M WIB')
                 except:
                     pass
             status = "⏰ EXPIRED" if expired else "🟢 Active"
             embed.add_field(
                 name=f"<@{discord_id}>",
-                value=f"HWID: `{hwid[:8]}...`\nVerified: {verified_at}\nExpiry: {expiry_date or 'N/A'}\nStatus: {status}",
+                value=f"HWID: `{hwid[:8]}...`\nVerified: {verified_at}\nExpiry: {exp_display}\nStatus: {status}",
                 inline=False
             )
         await ctx.send(embed=embed)
@@ -256,11 +266,11 @@ async def my_hwid(ctx):
         row = await cursor.fetchone()
         if row:
             hwid, verified, verified_at, expiry_date = row
-            now_utc = datetime.utcnow()
+            now_wib = get_wib_time()
             expired = False
             if expiry_date:
                 try:
-                    if now_utc > datetime.fromisoformat(expiry_date):
+                    if now_wib > datetime.fromisoformat(expiry_date):
                         expired = True
                 except:
                     pass
@@ -277,7 +287,15 @@ async def my_hwid(ctx):
                 inline=True
             )
             embed.add_field(name="Verified At", value=verified_at or "Never", inline=True)
-            embed.add_field(name="Expiry Date", value=expiry_date or "Not set", inline=False)
+            
+            exp_display = "Not set"
+            if expiry_date:
+                try:
+                    exp_display = datetime.fromisoformat(expiry_date).strftime('%Y-%m-%d %H:%M WIB')
+                except:
+                    exp_display = expiry_date
+                    
+            embed.add_field(name="Expiry Date", value=exp_display, inline=False)
             embed.add_field(
                 name="Status",
                 value="⏰ EXPIRED" if expired else "🟢 Active",
@@ -312,11 +330,13 @@ def verify_hwid_api():
 
     expired = False
     expiry_iso = None
+    now_wib = get_wib_time()
+    
     if expiry_date_str:
         try:
             expiry_dt = datetime.fromisoformat(expiry_date_str)
             expiry_iso = expiry_dt.isoformat()
-            if datetime.utcnow() > expiry_dt:
+            if now_wib > expiry_dt:
                 expired = True
                 verified = False
         except Exception:
@@ -343,12 +363,11 @@ def get_user_from_hwid():
             )
             row = await cursor.fetchone()
             if row:
-                # Cek expiry
                 expiry_str = row[2]
                 if expiry_str:
                     try:
-                        if datetime.utcnow() > datetime.fromisoformat(expiry_str):
-                            return None  # expired
+                        if get_wib_time() > datetime.fromisoformat(expiry_str):
+                            return None
                     except:
                         pass
                 return {"discord_id": row[0], "username": row[1], "expiry_date": expiry_str}
