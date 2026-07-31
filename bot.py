@@ -15,6 +15,9 @@ if not TOKEN:
 
 DATABASE_FILE = "hwid.db"
 
+# Sistem Lock untuk mencegah proses ganda di milidetik yang sama
+processing_users = set()
+
 # Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
 def get_wib_time():
     return datetime.utcnow() + timedelta(hours=7)
@@ -92,38 +95,48 @@ async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int =
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
 
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        # CEK ANTI DOBEL: Kalau user sudah verified, TOLAK dan jangan kirim apa-apa lagi
-        cursor = await db.execute('SELECT verified, hwid FROM users WHERE discord_id = ?', (member.id,))
-        row = await cursor.fetchone()
-        
-        if row and row[0] == 1:
-            msg = f"ℹ️ {member.display_name} sudah terverifikasi." if row[1] == hwid else f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID lain. Gunakan !unverifyhwid untuk ganti."
-            await ctx.send(msg)
-            return
+    # Mencegah eksekusi ganda jika tombol/command terkirim 2x secara bersamaan
+    if member.id in processing_users:
+        return
+    
+    processing_users.add(member.id)
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            # CEK ANTI DOBEL: Kalau user sudah verified, TOLAK dan jangan kirim apa-apa lagi
+            cursor = await db.execute('SELECT verified, hwid FROM users WHERE discord_id = ?', (member.id,))
+            row = await cursor.fetchone()
+            
+            if row and row[0] == 1:
+                msg = f"ℹ️ {member.display_name} sudah terverifikasi." if row[1] == hwid else f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID lain. Gunakan !unverifyhwid untuk ganti."
+                await ctx.send(msg)
+                return
 
-        # Cek HWID bentrok
-        cursor = await db.execute('SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?', (hwid, member.id))
-        if await cursor.fetchone():
-            await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
-            return
+            # Cek HWID bentrok
+            cursor = await db.execute('SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?', (hwid, member.id))
+            if await cursor.fetchone():
+                await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
+                return
 
-        expiry_date = get_wib_time() + timedelta(days=expiry_days)
-        await db.execute('''
-            INSERT INTO users (discord_id, username, hwid, verified, expiry_date)
-            VALUES (?, ?, ?, 1, ?)
-            ON CONFLICT(discord_id) DO UPDATE SET hwid = excluded.hwid, verified = 1, verified_at = CURRENT_TIMESTAMP, expiry_date = excluded.expiry_date
-        ''', (member.id, str(member), hwid, expiry_date.isoformat()))
-        await db.commit()
+            expiry_date = get_wib_time() + timedelta(days=expiry_days)
+            await db.execute('''
+                INSERT INTO users (discord_id, username, hwid, verified, expiry_date)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(discord_id) DO UPDATE SET hwid = excluded.hwid, verified = 1, verified_at = CURRENT_TIMESTAMP, expiry_date = excluded.expiry_date
+            ''', (member.id, str(member), hwid, expiry_date.isoformat()))
+            await db.commit()
 
-        # Kirim DM (Cuma 1x)
-        try:
-            await member.send(f"✅ HWID Anda `{hwid}` telah diverifikasi!\n⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n⏳ Durasi: **{expiry_days} hari**")
-        except discord.Forbidden:
-            pass
+            # Kirim DM (Cuma 1x)
+            try:
+                await member.send(f"✅ HWID Anda `{hwid}` telah diverifikasi!\n⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n⏳ Durasi: **{expiry_days} hari**")
+            except discord.Forbidden:
+                pass
 
-        # Kirim Chat Server (Cuma 1x)
-        await ctx.send(f"✅ HWID `{hwid}` verified for {member.display_name}!\n⏰ Expiry: **{expiry_days} days** ({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})")
+            # Kirim Chat Server (Cuma 1x)
+            await ctx.send(f"✅ HWID `{hwid}` verified for {member.display_name}!\n⏰ Expiry: **{expiry_days} days** ({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})")
+            
+    finally:
+        # Hapus user dari daftar proses setelah command selesai dieksekusi
+        processing_users.discard(member.id)
 
 @bot.command(name='extendhwid')
 @commands.has_permissions(administrator=True)
