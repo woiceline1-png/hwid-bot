@@ -1,10 +1,8 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import aiosqlite
 import asyncio
 import os
-import sqlite3
-import sys
 import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
@@ -16,30 +14,6 @@ if not TOKEN:
     raise ValueError("DISCORD_TOKEN tidak ditemukan di environment variable!")
 
 DATABASE_FILE = "hwid.db"
-
-
-class AlreadyProcessed(commands.CommandError):
-    pass
-
-
-_processed_message_ids = set()
-_command_locks = {}
-
-
-def acquire_single_instance_lock():
-    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.lock')
-    lock_file = open(lock_path, 'w')
-    try:
-        if sys.platform == 'win32':
-            import msvcrt
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise RuntimeError('Bot sudah jalan di instance lain! Matikan duplikat dulu.')
-    return lock_file
-
 
 # Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
 def get_wib_time():
@@ -62,113 +36,7 @@ async def init_db():
             await db.execute('ALTER TABLE users ADD COLUMN expiry_date TIMESTAMP')
         except:
             pass
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS command_dedup (
-                message_id INTEGER PRIMARY KEY,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute(
-            "DELETE FROM command_dedup WHERE processed_at < datetime('now', '-7 days')"
-        )
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
         await db.commit()
-
-
-async def get_saved_voice_channel_id():
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        cursor = await db.execute(
-            "SELECT value FROM bot_settings WHERE key = 'voice_channel_id'"
-        )
-        row = await cursor.fetchone()
-        return int(row[0]) if row else None
-
-
-async def save_voice_channel_id(channel_id: int):
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('''
-            INSERT INTO bot_settings (key, value) VALUES ('voice_channel_id', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        ''', (str(channel_id),))
-        await db.commit()
-
-
-async def clear_saved_voice_channel_id():
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute(
-            "DELETE FROM bot_settings WHERE key = 'voice_channel_id'"
-        )
-        await db.commit()
-
-
-voice_reconnect_lock = asyncio.Lock()
-
-
-async def reconnect_voice_channel():
-    channel_id = await get_saved_voice_channel_id()
-    if not channel_id:
-        return False
-
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except discord.HTTPException:
-            print(f'❌ Voice channel {channel_id} tidak ditemukan')
-            return False
-
-    if not isinstance(channel, discord.VoiceChannel):
-        return False
-
-    if any(vc.channel and vc.channel.id == channel_id for vc in bot.voice_clients):
-        return True
-
-    for vc in bot.voice_clients:
-        await vc.disconnect(force=True)
-
-    try:
-        await channel.connect(reconnect=True, self_deaf=True)
-        print(f'🔊 Bot reconnect ke voice: {channel.name}')
-        return True
-    except Exception as e:
-        print(f'❌ Gagal reconnect voice: {e}')
-        return False
-
-
-async def claim_command_message(message_id: int) -> bool:
-    if message_id in _processed_message_ids:
-        return False
-
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        try:
-            await db.execute('BEGIN IMMEDIATE')
-            await db.execute(
-                'INSERT INTO command_dedup (message_id) VALUES (?)',
-                (message_id,)
-            )
-            await db.commit()
-            _processed_message_ids.add(message_id)
-            if len(_processed_message_ids) > 2000:
-                _processed_message_ids.clear()
-            return True
-        except sqlite3.IntegrityError:
-            await db.rollback()
-            return False
-
-
-async def bot_replied_to_command(ctx) -> bool:
-    async for msg in ctx.channel.history(limit=25):
-        if msg.author.id != bot.user.id:
-            continue
-        ref = msg.reference
-        if ref and ref.message_id == ctx.message.id:
-            return True
-    return False
 
 # ===== DISCORD BOT =====
 intents = discord.Intents.default()
@@ -177,87 +45,10 @@ intents.members = True
 intents.voice_states = True # Ditambahkan agar bot bisa detect & join voice
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-
-@tasks.loop(seconds=30)
-async def keep_voice_connected():
-    channel_id = await get_saved_voice_channel_id()
-    if not channel_id:
-        return
-    connected = any(
-        vc.channel and vc.channel.id == channel_id
-        for vc in bot.voice_clients
-    )
-    if not connected:
-        async with voice_reconnect_lock:
-            await reconnect_voice_channel()
-
-
-@keep_voice_connected.before_loop
-async def before_keep_voice_connected():
-    await bot.wait_until_ready()
-
-
 @bot.event
 async def on_ready():
     await init_db()
     print(f'✅ Bot ready! Logged in as {bot.user}')
-    if not keep_voice_connected.is_running():
-        keep_voice_connected.start()
-    await reconnect_voice_channel()
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.id != bot.user.id:
-        return
-    channel_id = await get_saved_voice_channel_id()
-    if not channel_id:
-        return
-    if after.channel is None or after.channel.id != channel_id:
-        await asyncio.sleep(3)
-        async with voice_reconnect_lock:
-            await reconnect_voice_channel()
-
-@bot.before_invoke
-async def prevent_duplicate_commands(ctx):
-    if not await claim_command_message(ctx.message.id):
-        raise AlreadyProcessed()
-
-    lock = _command_locks.setdefault(ctx.message.id, asyncio.Lock())
-    await lock.acquire()
-    ctx._dedup_lock = lock
-
-    original_send = ctx.send
-
-    async def guarded_send(*args, **kwargs):
-        if await bot_replied_to_command(ctx):
-            return None
-        kwargs.setdefault('reference', ctx.message)
-        kwargs.setdefault('fail_on_not_exists', False)
-        return await original_send(*args, **kwargs)
-
-    ctx.send = guarded_send
-
-
-@bot.after_invoke
-async def release_command_lock(ctx):
-    lock = getattr(ctx, '_dedup_lock', None)
-    if lock and lock.locked():
-        lock.release()
-    _command_locks.pop(ctx.message.id, None)
-
-@bot.event
-async def on_command_error(ctx, error):
-    lock = getattr(ctx, '_dedup_lock', None)
-    if lock and lock.locked():
-        lock.release()
-    _command_locks.pop(ctx.message.id, None)
-
-    if isinstance(error, AlreadyProcessed):
-        return
-    if isinstance(error, commands.CommandNotFound):
-        return
-    raise error
 
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
@@ -460,9 +251,8 @@ async def join_voice(ctx, channel_id: int = None):
             return
 
     try:
-        await voice_channel.connect(reconnect=True, self_deaf=True)
-        await save_voice_channel_id(voice_channel.id)
-        await ctx.send(f"✅ Bot berhasil join ke **{voice_channel.name}**!\n🔄 Auto-reconnect aktif jika bot disconnect.")
+        await voice_channel.connect()
+        await ctx.send(f"✅ Bot berhasil join ke **{voice_channel.name}**!")
     except discord.Forbidden:
         await ctx.send("❌ Bot tidak punya izin untuk join ke voice channel tersebut.")
     except Exception as e:
@@ -471,15 +261,12 @@ async def join_voice(ctx, channel_id: int = None):
 @bot.command(name='leavevoice')
 @commands.has_permissions(administrator=True)
 async def leave_voice(ctx):
-    """Bot keluar dari voice channel dan matikan auto-reconnect."""
-    await clear_saved_voice_channel_id()
+    """Bot keluar dari voice channel."""
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("✅ Bot telah keluar dari voice channel. Auto-reconnect dimatikan.")
+        await ctx.send("✅ Bot telah keluar dari voice channel.")
     else:
-        for vc in bot.voice_clients:
-            await vc.disconnect(force=True)
-        await ctx.send("✅ Auto-reconnect dimatikan.")
+        await ctx.send("❌ Bot sedang tidak berada di voice channel.")
 
 # ===== FLASK API =====
 app = Flask(__name__)
@@ -531,7 +318,6 @@ def run_api():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    _bot_lock = acquire_single_instance_lock()
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
     bot.run(TOKEN)
