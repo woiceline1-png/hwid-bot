@@ -3,6 +3,8 @@ from discord.ext import commands, tasks
 import aiosqlite
 import asyncio
 import os
+import sqlite3
+import sys
 import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
@@ -18,6 +20,25 @@ DATABASE_FILE = "hwid.db"
 
 class AlreadyProcessed(commands.CommandError):
     pass
+
+
+_processed_message_ids = set()
+_command_locks = {}
+
+
+def acquire_single_instance_lock():
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.lock')
+    lock_file = open(lock_path, 'w')
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise RuntimeError('Bot sudah jalan di instance lain! Matikan duplikat dulu.')
+    return lock_file
 
 
 # Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
@@ -120,16 +141,34 @@ async def reconnect_voice_channel():
 
 
 async def claim_command_message(message_id: int) -> bool:
+    if message_id in _processed_message_ids:
+        return False
+
     async with aiosqlite.connect(DATABASE_FILE) as db:
         try:
+            await db.execute('BEGIN IMMEDIATE')
             await db.execute(
                 'INSERT INTO command_dedup (message_id) VALUES (?)',
                 (message_id,)
             )
             await db.commit()
+            _processed_message_ids.add(message_id)
+            if len(_processed_message_ids) > 2000:
+                _processed_message_ids.clear()
             return True
-        except aiosqlite.IntegrityError:
+        except sqlite3.IntegrityError:
+            await db.rollback()
             return False
+
+
+async def bot_replied_to_command(ctx) -> bool:
+    async for msg in ctx.channel.history(limit=25):
+        if msg.author.id != bot.user.id:
+            continue
+        ref = msg.reference
+        if ref and ref.message_id == ctx.message.id:
+            return True
+    return False
 
 # ===== DISCORD BOT =====
 intents = discord.Intents.default()
@@ -184,8 +223,36 @@ async def prevent_duplicate_commands(ctx):
     if not await claim_command_message(ctx.message.id):
         raise AlreadyProcessed()
 
+    lock = _command_locks.setdefault(ctx.message.id, asyncio.Lock())
+    await lock.acquire()
+    ctx._dedup_lock = lock
+
+    original_send = ctx.send
+
+    async def guarded_send(*args, **kwargs):
+        if await bot_replied_to_command(ctx):
+            return None
+        kwargs.setdefault('reference', ctx.message)
+        kwargs.setdefault('fail_on_not_exists', False)
+        return await original_send(*args, **kwargs)
+
+    ctx.send = guarded_send
+
+
+@bot.after_invoke
+async def release_command_lock(ctx):
+    lock = getattr(ctx, '_dedup_lock', None)
+    if lock and lock.locked():
+        lock.release()
+    _command_locks.pop(ctx.message.id, None)
+
 @bot.event
 async def on_command_error(ctx, error):
+    lock = getattr(ctx, '_dedup_lock', None)
+    if lock and lock.locked():
+        lock.release()
+    _command_locks.pop(ctx.message.id, None)
+
     if isinstance(error, AlreadyProcessed):
         return
     if isinstance(error, commands.CommandNotFound):
@@ -464,6 +531,7 @@ def run_api():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False, use_reloader=False)
 
 if __name__ == "__main__":
+    _bot_lock = acquire_single_instance_lock()
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
     bot.run(TOKEN)
