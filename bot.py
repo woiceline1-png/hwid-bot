@@ -15,7 +15,9 @@ if not TOKEN:
 
 DATABASE_FILE = "hwid.db"
 
-# Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
+class AlreadyProcessed(commands.CommandError):
+    pass
+
 def get_wib_time():
     return datetime.utcnow() + timedelta(hours=7)
 
@@ -36,19 +38,52 @@ async def init_db():
             await db.execute('ALTER TABLE users ADD COLUMN expiry_date TIMESTAMP')
         except:
             pass
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS command_dedup (
+                message_id INTEGER PRIMARY KEY,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute(
+            "DELETE FROM command_dedup WHERE processed_at < datetime('now', '-7 days')"
+        )
         await db.commit()
+
+async def claim_command_message(message_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute(
+                'INSERT INTO command_dedup (message_id) VALUES (?)',
+                (message_id,)
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
 
 # ===== DISCORD BOT =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.voice_states = True # Ditambahkan agar bot bisa detect & join voice
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
     await init_db()
     print(f'✅ Bot ready! Logged in as {bot.user}')
+
+@bot.before_invoke
+async def prevent_duplicate_commands(ctx):
+    if not await claim_command_message(ctx.message.id):
+        raise AlreadyProcessed()
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, AlreadyProcessed):
+        return
+    if isinstance(error, commands.CommandNotFound):
+        return
+    raise error
 
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
@@ -227,46 +262,6 @@ async def clear_dm(ctx, member: discord.Member):
         await ctx.send(f"✅ Berhasil menghapus **{deleted_count}** pesan bot di DM {member.display_name}.")
     except:
         await ctx.send(f"❌ Gagal mengakses DM {member.display_name}.")
-
-# ===== VOICE COMMANDS =====
-@bot.command(name='joinvoice')
-@commands.has_permissions(administrator=True)
-async def join_voice(ctx, channel_id: int = None):
-    """Bot masuk ke voice channel. Bisa pakai ID atau join ke voice user."""
-    if ctx.voice_client:
-        await ctx.send("ℹ️ Bot sudah berada di voice channel. Gunakan `!leavevoice` dulu.")
-        return
-
-    voice_channel = None
-    if channel_id:
-        voice_channel = bot.get_channel(channel_id)
-        if not voice_channel or not isinstance(voice_channel, discord.VoiceChannel):
-            await ctx.send("❌ Channel ID tidak valid atau itu bukan Voice Channel!")
-            return
-    else:
-        if ctx.author.voice:
-            voice_channel = ctx.author.voice.channel
-        else:
-            await ctx.send("❌ Kamu tidak di voice channel, atau berikan ID Voice Channel! Format: `!joinvoice <channel_id>`")
-            return
-
-    try:
-        await voice_channel.connect()
-        await ctx.send(f"✅ Bot berhasil join ke **{voice_channel.name}**!")
-    except discord.Forbidden:
-        await ctx.send("❌ Bot tidak punya izin untuk join ke voice channel tersebut.")
-    except Exception as e:
-        await ctx.send(f"❌ Terjadi error saat join: {str(e)}")
-
-@bot.command(name='leavevoice')
-@commands.has_permissions(administrator=True)
-async def leave_voice(ctx):
-    """Bot keluar dari voice channel."""
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("✅ Bot telah keluar dari voice channel.")
-    else:
-        await ctx.send("❌ Bot sedang tidak berada di voice channel.")
 
 # ===== FLASK API =====
 app = Flask(__name__)
