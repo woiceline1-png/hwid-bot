@@ -15,9 +15,6 @@ if not TOKEN:
 
 DATABASE_FILE = "hwid.db"
 
-# Sistem Lock untuk mencegah proses ganda di milidetik yang sama
-processing_users = set()
-
 # Helper untuk Waktu Indonesia Barat (WIB / UTC+7)
 def get_wib_time():
     return datetime.utcnow() + timedelta(hours=7)
@@ -45,7 +42,7 @@ async def init_db():
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.voice_states = True # Ditambahkan agar bot bisa detect & join voice
+intents.voice_states = True 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
@@ -55,6 +52,7 @@ async def on_ready():
 
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def check_hwid(ctx, member: discord.Member = None):
     if member is None:
         member = ctx.author
@@ -90,56 +88,44 @@ async def check_hwid(ctx, member: discord.Member = None):
 
 @bot.command(name='verifyhwid')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def verify_hwid(ctx, member: discord.Member, hwid: str, expiry_days: int = 30):
     if expiry_days < 1 or expiry_days > 9999:
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
 
-    # Mencegah eksekusi ganda jika tombol/command terkirim 2x secara bersamaan
-    if member.id in processing_users:
-        return
-    
-    processing_users.add(member.id)
-    try:
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            # CEK ANTI DOBEL: Kalau user sudah verified, TOLAK dan jangan kirim apa-apa lagi
-            cursor = await db.execute('SELECT verified, hwid FROM users WHERE discord_id = ?', (member.id,))
-            row = await cursor.fetchone()
-            
-            if row and row[0] == 1:
-                msg = f"ℹ️ {member.display_name} sudah terverifikasi." if row[1] == hwid else f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID lain. Gunakan !unverifyhwid untuk ganti."
-                await ctx.send(msg)
-                return
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute('SELECT verified, hwid FROM users WHERE discord_id = ?', (member.id,))
+        row = await cursor.fetchone()
+        
+        if row and row[0] == 1:
+            msg = f"ℹ️ {member.display_name} sudah terverifikasi." if row[1] == hwid else f"ℹ️ {member.display_name} sudah terverifikasi dengan HWID lain. Gunakan !unverifyhwid untuk ganti."
+            await ctx.send(msg)
+            return
 
-            # Cek HWID bentrok
-            cursor = await db.execute('SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?', (hwid, member.id))
-            if await cursor.fetchone():
-                await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
-                return
+        cursor = await db.execute('SELECT discord_id FROM users WHERE hwid = ? AND discord_id != ?', (hwid, member.id))
+        if await cursor.fetchone():
+            await ctx.send(f"❌ HWID `{hwid}` already used by another user!")
+            return
 
-            expiry_date = get_wib_time() + timedelta(days=expiry_days)
-            await db.execute('''
-                INSERT INTO users (discord_id, username, hwid, verified, expiry_date)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(discord_id) DO UPDATE SET hwid = excluded.hwid, verified = 1, verified_at = CURRENT_TIMESTAMP, expiry_date = excluded.expiry_date
-            ''', (member.id, str(member), hwid, expiry_date.isoformat()))
-            await db.commit()
+        expiry_date = get_wib_time() + timedelta(days=expiry_days)
+        await db.execute('''
+            INSERT INTO users (discord_id, username, hwid, verified, expiry_date)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET hwid = excluded.hwid, verified = 1, verified_at = CURRENT_TIMESTAMP, expiry_date = excluded.expiry_date
+        ''', (member.id, str(member), hwid, expiry_date.isoformat()))
+        await db.commit()
 
-            # Kirim DM (Cuma 1x)
-            try:
-                await member.send(f"✅ HWID Anda `{hwid}` telah diverifikasi!\n⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n⏳ Durasi: **{expiry_days} hari**")
-            except discord.Forbidden:
-                pass
+        try:
+            await member.send(f"✅ HWID Anda `{hwid}` telah diverifikasi!\n⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n⏳ Durasi: **{expiry_days} hari**")
+        except discord.Forbidden:
+            pass
 
-            # Kirim Chat Server (Cuma 1x)
-            await ctx.send(f"✅ HWID `{hwid}` verified for {member.display_name}!\n⏰ Expiry: **{expiry_days} days** ({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})")
-            
-    finally:
-        # Hapus user dari daftar proses setelah command selesai dieksekusi
-        processing_users.discard(member.id)
+        await ctx.send(f"✅ HWID `{hwid}` verified for {member.display_name}!\n⏰ Expiry: **{expiry_days} days** ({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})")
 
 @bot.command(name='extendhwid')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def extend_hwid(ctx, member: discord.Member, additional_days: int):
     if additional_days < 1 or additional_days > 9999:
         await ctx.send("❌ Days must be between 1 and 9999!")
@@ -165,6 +151,7 @@ async def extend_hwid(ctx, member: discord.Member, additional_days: int):
 
 @bot.command(name='unverifyhwid')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def unverify_hwid(ctx, member: discord.Member):
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('UPDATE users SET verified = 0 WHERE discord_id = ?', (member.id,))
@@ -173,6 +160,7 @@ async def unverify_hwid(ctx, member: discord.Member):
 
 @bot.command(name='listhwid')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def list_hwid(ctx):
     async with aiosqlite.connect(DATABASE_FILE) as db:
         cursor = await db.execute('SELECT discord_id, username, hwid, verified_at, expiry_date FROM users WHERE verified = 1')
@@ -197,6 +185,7 @@ async def list_hwid(ctx):
         await ctx.send(embed=embed)
 
 @bot.command(name='myhwid')
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def my_hwid(ctx):
     async with aiosqlite.connect(DATABASE_FILE) as db:
         cursor = await db.execute('SELECT hwid, verified, verified_at, expiry_date FROM users WHERE discord_id = ?', (ctx.author.id,))
@@ -225,6 +214,7 @@ async def my_hwid(ctx):
 
 @bot.command(name='cleardm')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def clear_dm(ctx, member: discord.Member):
     dm_channel = member.dm_channel if member.dm_channel else await member.create_dm()
     await ctx.send(f"🧹 Sedang membersihkan DM bot dengan {member.display_name}...")
@@ -244,6 +234,7 @@ async def clear_dm(ctx, member: discord.Member):
 # ===== VOICE COMMANDS =====
 @bot.command(name='joinvoice')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def join_voice(ctx, channel_id: int = None):
     """Bot masuk ke voice channel. Bisa pakai ID atau join ke voice user."""
     if ctx.voice_client:
@@ -273,6 +264,7 @@ async def join_voice(ctx, channel_id: int = None):
 
 @bot.command(name='leavevoice')
 @commands.has_permissions(administrator=True)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def leave_voice(ctx):
     """Bot keluar dari voice channel."""
     if ctx.voice_client:
@@ -280,6 +272,14 @@ async def leave_voice(ctx):
         await ctx.send("✅ Bot telah keluar dari voice channel.")
     else:
         await ctx.send("❌ Bot sedang tidak berada di voice channel.")
+
+# Handler untuk error MaxConcurrency supaya bot tidak crash saat dipam command
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MaxConcurrencyReached):
+        await ctx.send("⏳ Sedang memproses perintah kamu sebelumnya, tunggu sebentar!", delete_after=5)
+    else:
+        pass # Bisa diisi handler error lain jika diperlukan
 
 # ===== FLASK API =====
 app = Flask(__name__)
