@@ -303,8 +303,19 @@ async def prevent_duplicate_commands(ctx):
                 return None
         except Exception:
             pass
-        kwargs.setdefault('reference', ctx.message)
-        kwargs.setdefault('fail_on_not_exists', False)
+
+        # Reference handling — gunakan MessageReference yang benar
+        # (fail_on_not_exists hanya ada di MessageReference / Message.reply,
+        #  BUKAN di Context.send())
+        reference = kwargs.pop('reference', None)
+        if reference is not None and 'reference' not in kwargs:
+            try:
+                kwargs['reference'] = discord.MessageReference.from_message(
+                    reference, fail_on_not_exists=False
+                )
+            except Exception:
+                kwargs['reference'] = reference
+
         try:
             return await original_send(*args, **kwargs)
         except discord.HTTPException as e:
@@ -329,13 +340,11 @@ async def on_command_error(ctx, error):
         lock.release()
     _command_locks.pop(ctx.message.id, None)
 
-    # Diam untuk duplikat & command tidak dikenal
     if isinstance(error, AlreadyProcessed):
         return
     if isinstance(error, commands.CommandNotFound):
         return
 
-    # Tangani error umum → kirim pesan ke user
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Kamu tidak punya izin **Administrator** untuk pakai command ini!")
         return
@@ -349,7 +358,6 @@ async def on_command_error(ctx, error):
         await ctx.send("❌ Kamu tidak bisa pakai command ini!")
         return
 
-    # Error lain → log + tampilkan ke user
     print(f"❌ ERROR di command {ctx.command}: {type(error).__name__}: {error}")
     traceback.print_exc()
     try:
@@ -416,13 +424,7 @@ async def help_ext(ctx):
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
 async def check_hwid(ctx, user_input: str = None):
-    """
-    Cek HWID user.
-    Usage:
-      !checkhwid                          → cek diri sendiri
-      !checkhwid @user                    → cek via mention
-      !checkhwid 1515667018961915966      → cek via Discord ID
-    """
+    """Cek HWID user (mention atau Discord ID)."""
     if user_input is None:
         user = ctx.author
     else:
@@ -473,12 +475,7 @@ async def check_hwid(ctx, user_input: str = None):
 @bot.command(name='verifyhwid')
 @commands.has_permissions(administrator=True)
 async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
-    """
-    Verify HWID user.
-    Usage:
-      !verifyhwid @user HWID123              → verify via mention (30 hari)
-      !verifyhwid 1515667018961915966 HWID123 60  → verify via Discord ID (60 hari)
-    """
+    """Verify HWID user (mention atau Discord ID)."""
     if expiry_days < 1 or expiry_days > 9999:
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
@@ -527,16 +524,14 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
         ''', (user.id, str(user), hwid, expiry_date.isoformat()))
         await db.commit()
 
-        # Kirim DM (Cuma 1x) — walau user tidak di server
+        # Kirim DM (Cuma 1x)
         try:
             await user.send(
                 f"✅ HWID Anda `{hwid}` telah diverifikasi!\n"
                 f"⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n"
                 f"⏳ Durasi: **{expiry_days} hari**"
             )
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
+        except (discord.Forbidden, discord.HTTPException):
             pass
 
         await ctx.send(
@@ -549,12 +544,7 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
 @bot.command(name='extendhwid')
 @commands.has_permissions(administrator=True)
 async def extend_hwid(ctx, user_input: str, additional_days: int):
-    """
-    Perpanjang expiry HWID user.
-    Usage:
-      !extendhwid @user 30
-      !extendhwid 1515667018961915966 30
-    """
+    """Perpanjang expiry HWID user (mention atau Discord ID)."""
     if additional_days < 1 or additional_days > 9999:
         await ctx.send("❌ Days must be between 1 and 9999!")
         return
@@ -599,12 +589,7 @@ async def extend_hwid(ctx, user_input: str, additional_days: int):
 @bot.command(name='unverifyhwid')
 @commands.has_permissions(administrator=True)
 async def unverify_hwid(ctx, user_input: str):
-    """
-    Unverify HWID user.
-    Usage:
-      !unverifyhwid @user
-      !unverifyhwid 1515667018961915966
-    """
+    """Unverify HWID user (mention atau Discord ID)."""
     user, err = await resolve_user(ctx, user_input)
     if err:
         await ctx.send(err)
@@ -693,12 +678,7 @@ async def my_hwid(ctx):
 @bot.command(name='cleardm')
 @commands.has_permissions(administrator=True)
 async def clear_dm(ctx, user_input: str):
-    """
-    Hapus pesan bot di DM user.
-    Usage:
-      !cleardm @user
-      !cleardm 1515667018961915966
-    """
+    """Hapus pesan bot di DM user (mention atau Discord ID)."""
     user, err = await resolve_user(ctx, user_input)
     if err:
         await ctx.send(err)
