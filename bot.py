@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
+import traceback
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -162,12 +163,15 @@ async def claim_command_message(message_id: int) -> bool:
 
 
 async def bot_replied_to_command(ctx) -> bool:
-    async for msg in ctx.channel.history(limit=25):
-        if msg.author.id != bot.user.id:
-            continue
-        ref = msg.reference
-        if ref and ref.message_id == ctx.message.id:
-            return True
+    try:
+        async for msg in ctx.channel.history(limit=25):
+            if msg.author.id != bot.user.id:
+                continue
+            ref = msg.reference
+            if ref and ref.message_id == ctx.message.id:
+                return True
+    except discord.HTTPException:
+        pass
     return False
 
 
@@ -181,15 +185,13 @@ async def resolve_user(ctx, user_input: str):
       - Raw ID  : 1515667018961915966
 
     Return: (user_object, error_message)
-    - Jika user ada di guild  → return discord.Member
-    - Jika user TIDAK ada di guild → return discord.User (fetch dari API)
     """
     if not user_input:
         return None, "❌ User tidak boleh kosong!"
 
     user_id = None
 
-    # ---- Case 1: Format mention <@123456> atau <@!123456> ----
+    # Case 1: Format mention <@123456> atau <@!123456>
     if user_input.startswith('<@') and user_input.endswith('>'):
         clean = user_input[2:-1].lstrip('!')
         try:
@@ -197,7 +199,7 @@ async def resolve_user(ctx, user_input: str):
         except ValueError:
             pass
     else:
-        # ---- Case 2: Raw Discord ID (angka saja) ----
+        # Case 2: Raw Discord ID (angka saja)
         try:
             user_id = int(user_input.strip())
         except ValueError:
@@ -210,14 +212,16 @@ async def resolve_user(ctx, user_input: str):
             "Contoh: `!verifyhwid 1515667018961915966 HWID123 30`"
         )
 
-    # ---- Coba cari sebagai Member dulu (jika ada di guild) ----
+    # Coba cari sebagai Member dulu (jika ada di guild)
     if ctx.guild:
-        member = ctx.guild.get_member(user_id)
-        if member:
-            return member, None
+        try:
+            member = ctx.guild.get_member(user_id)
+            if member:
+                return member, None
+        except Exception:
+            pass
 
-    # ---- Jika tidak ada di guild, fetch sebagai User via API ----
-    # Ini memungkinkan verify user yang BELUM join server Discord!
+    # Jika tidak ada di guild, fetch sebagai User via API
     try:
         user = await bot.fetch_user(user_id)
         return user, None
@@ -293,11 +297,19 @@ async def prevent_duplicate_commands(ctx):
     original_send = ctx.send
 
     async def guarded_send(*args, **kwargs):
-        if await bot_replied_to_command(ctx):
-            return None
+        # Anti-spam: skip jika sudah pernah balas
+        try:
+            if await bot_replied_to_command(ctx):
+                return None
+        except Exception:
+            pass
         kwargs.setdefault('reference', ctx.message)
         kwargs.setdefault('fail_on_not_exists', False)
-        return await original_send(*args, **kwargs)
+        try:
+            return await original_send(*args, **kwargs)
+        except discord.HTTPException as e:
+            print(f"❌ Gagal kirim pesan: {e}")
+            return None
 
     ctx.send = guarded_send
 
@@ -317,23 +329,89 @@ async def on_command_error(ctx, error):
         lock.release()
     _command_locks.pop(ctx.message.id, None)
 
+    # Diam untuk duplikat & command tidak dikenal
     if isinstance(error, AlreadyProcessed):
         return
     if isinstance(error, commands.CommandNotFound):
         return
-    # Tangani error konversi parameter (misal: expiry_days bukan angka)
+
+    # Tangani error umum → kirim pesan ke user
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Kamu tidak punya izin **Administrator** untuk pakai command ini!")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Parameter kurang: `{error.param.name}`\n💡 Cek format command!")
+        return
     if isinstance(error, commands.BadArgument):
         await ctx.send(f"❌ Parameter tidak valid: {str(error)}")
         return
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Parameter kurang: `{error.param.name}`")
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ Kamu tidak bisa pakai command ini!")
         return
-    raise error
+
+    # Error lain → log + tampilkan ke user
+    print(f"❌ ERROR di command {ctx.command}: {type(error).__name__}: {error}")
+    traceback.print_exc()
+    try:
+        await ctx.send(f"❌ Terjadi error: `{type(error).__name__}: {str(error)}`")
+    except Exception:
+        pass
 
 
 # ====================================================================
-# ===== COMMANDS (SUPPORT MENTION & DISCORD ID) ======================
+# ===== COMMANDS =====================================================
 # ====================================================================
+
+@bot.command(name='ping')
+async def ping(ctx):
+    """Test apakah bot merespon."""
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: **{latency_ms}ms**\n🤖 Bot online dan merespon!")
+
+
+@bot.command(name='helpext')
+@commands.has_permissions(administrator=True)
+async def help_ext(ctx):
+    """Tampilkan daftar command lengkap."""
+    embed = discord.Embed(
+        title="📖 Daftar Command Bot",
+        description="**User bisa pakai mention `@user` ATAU Discord ID `1515667018961915966`**",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="🔧 Admin Commands",
+        value=(
+            "`!checkhwid [@user|ID]` — Cek HWID user\n"
+            "`!verifyhwid <@user|ID> <hwid> [days=30]` — Verify HWID\n"
+            "`!extendhwid <@user|ID> <days>` — Perpanjang expiry\n"
+            "`!unverifyhwid <@user|ID>` — Unverify HWID\n"
+            "`!listhwid` — List user verified\n"
+            "`!cleardm <@user|ID>` — Hapus DM bot\n"
+            "`!joinvoice [channel_id]` — Bot join voice\n"
+            "`!leavevoice` — Bot keluar voice\n"
+            "`!helpext` — Tampilkan help ini"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="👤 User Commands",
+        value=(
+            "`!myhwid` — Cek HWID sendiri\n"
+            "`!ping` — Test bot online"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="💡 Contoh Penggunaan",
+        value=(
+            "`!verifyhwid 1515667018961915966 944D3FDCA8CFD61B0A006D49FC32765A 999`\n"
+            "`!verifyhwid @username HWID123 30`\n"
+            "`!extendhwid 1515667018961915966 60`"
+        ),
+        inline=False
+    )
+    await ctx.send(embed=embed)
+
 
 @bot.command(name='checkhwid')
 @commands.has_permissions(administrator=True)
@@ -405,7 +483,6 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
 
-    # ---- RESOLVE USER (mention atau Discord ID) ----
     user, err = await resolve_user(ctx, user_input)
     if err:
         await ctx.send(err)
@@ -450,7 +527,7 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
         ''', (user.id, str(user), hwid, expiry_date.isoformat()))
         await db.commit()
 
-        # Kirim DM (Cuma 1x) — bisa DM user walau dia tidak di server
+        # Kirim DM (Cuma 1x) — walau user tidak di server
         try:
             await user.send(
                 f"✅ HWID Anda `{hwid}` telah diverifikasi!\n"
@@ -458,9 +535,10 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
                 f"⏳ Durasi: **{expiry_days} hari**"
             )
         except discord.Forbidden:
-            pass  # User tidak bisa di-DM (DM disabled / tidak ada shared server)
+            pass
+        except discord.HTTPException:
+            pass
 
-        # Kirim Chat Server (Cuma 1x)
         await ctx.send(
             f"✅ HWID `{hwid}` verified for {display_name}!\n"
             f"⏰ Expiry: **{expiry_days} days** "
@@ -648,6 +726,7 @@ async def clear_dm(ctx, user_input: str):
 @bot.command(name='joinvoice')
 @commands.has_permissions(administrator=True)
 async def join_voice(ctx, channel_id: int = None):
+    """Bot masuk ke voice channel."""
     if ctx.voice_client:
         await ctx.send("ℹ️ Bot sudah berada di voice channel. Gunakan `!leavevoice` dulu.")
         return
@@ -678,6 +757,7 @@ async def join_voice(ctx, channel_id: int = None):
 @bot.command(name='leavevoice')
 @commands.has_permissions(administrator=True)
 async def leave_voice(ctx):
+    """Bot keluar dari voice channel dan matikan auto-reconnect."""
     await clear_saved_voice_channel_id()
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
