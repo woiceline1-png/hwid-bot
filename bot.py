@@ -185,6 +185,8 @@ async def resolve_user(ctx, user_input: str):
       - Raw ID  : 1515667018961915966
 
     Return: (user_object, error_message)
+    Selalu usahakan return Member (bukan User biasa) agar DM bisa dikirim
+    dengan lebih andal untuk user yang ada di guild.
     """
     if not user_input:
         return None, "❌ User tidak boleh kosong!"
@@ -213,15 +215,24 @@ async def resolve_user(ctx, user_input: str):
         )
 
     # Coba cari sebagai Member dulu (jika ada di guild)
+    # Member punya akses lebih lengkap termasuk DM channel
     if ctx.guild:
         try:
             member = ctx.guild.get_member(user_id)
             if member:
                 return member, None
+            # Jika tidak di cache, coba fetch dari API
+            member = await ctx.guild.fetch_member(user_id)
+            if member:
+                return member, None
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            pass
         except Exception:
             pass
 
-    # Jika tidak ada di guild, fetch sebagai User via API
+    # Jika tidak ada di guild ATAU bukan di guild context, fetch sebagai User via API
     try:
         user = await bot.fetch_user(user_id)
         return user, None
@@ -229,6 +240,28 @@ async def resolve_user(ctx, user_input: str):
         return None, "❌ User tidak ditemukan di Discord! Cek kembali Discord ID-nya."
     except discord.HTTPException as e:
         return None, f"❌ Gagal mengambil data user: {str(e)}"
+
+
+async def safe_send_dm(user, content: str) -> bool:
+    """
+    Kirim DM ke user dengan aman, baik itu Member maupun User object.
+    Return True jika berhasil, False jika gagal.
+    """
+    try:
+        # Pastikan DM channel ada, buat kalau belum ada
+        if user.dm_channel is None:
+            await user.create_dm()
+        await user.send(content)
+        return True
+    except discord.Forbidden:
+        print(f"⚠️ Tidak bisa kirim DM ke {getattr(user, 'display_name', user)} — DM ditutup oleh user.")
+        return False
+    except discord.HTTPException as e:
+        print(f"⚠️ Gagal kirim DM ke {getattr(user, 'display_name', user)} — {e}")
+        return False
+    except Exception as e:
+        print(f"⚠️ Error tidak diketahui saat kirim DM ke {getattr(user, 'display_name', user)} — {e}")
+        return False
 
 
 def get_display_name(user) -> str:
@@ -305,8 +338,6 @@ async def prevent_duplicate_commands(ctx):
             pass
 
         # Reference handling — gunakan MessageReference yang benar
-        # (fail_on_not_exists hanya ada di MessageReference / Message.reply,
-        #  BUKAN di Context.send())
         reference = kwargs.pop('reference', None)
         if reference is not None and 'reference' not in kwargs:
             try:
@@ -414,7 +445,8 @@ async def help_ext(ctx):
         value=(
             "`!verifyhwid 1515667018961915966 944D3FDCA8CFD61B0A006D49FC32765A 999`\n"
             "`!verifyhwid @username HWID123 30`\n"
-            "`!extendhwid 1515667018961915966 60`"
+            "`!extendhwid 1515667018961915966 60`\n"
+            "`!cleardm 1515667018961915966`"
         ),
         inline=False
     )
@@ -475,7 +507,7 @@ async def check_hwid(ctx, user_input: str = None):
 @bot.command(name='verifyhwid')
 @commands.has_permissions(administrator=True)
 async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
-    """Verify HWID user (mention atau Discord ID)."""
+    """Verify HWID user (mention atau Discord ID). DM otomatis dikirim ke target."""
     if expiry_days < 1 or expiry_days > 9999:
         await ctx.send("❌ Expiry days must be between **1 and 9999**!")
         return
@@ -524,21 +556,24 @@ async def verify_hwid(ctx, user_input: str, hwid: str, expiry_days: int = 30):
         ''', (user.id, str(user), hwid, expiry_date.isoformat()))
         await db.commit()
 
-        # Kirim DM (Cuma 1x)
-        try:
-            await user.send(
-                f"✅ HWID Anda `{hwid}` telah diverifikasi!\n"
-                f"⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n"
-                f"⏳ Durasi: **{expiry_days} hari**"
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+    # Kirim DM ke target — baik via mention maupun raw User ID
+    dm_ok = await safe_send_dm(
+        user,
+        f"✅ HWID Anda `{hwid}` telah diverifikasi!\n"
+        f"⏰ Expired pada: `{expiry_date.strftime('%Y-%m-%d %H:%M WIB')}`\n"
+        f"⏳ Durasi: **{expiry_days} hari**"
+    )
 
-        await ctx.send(
-            f"✅ HWID `{hwid}` verified for {display_name}!\n"
-            f"⏰ Expiry: **{expiry_days} days** "
-            f"({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})"
-        )
+    dm_note = ""
+    if not dm_ok:
+        dm_note = "\n⚠️ **Gagal kirim DM ke user** — kemungkinan DM-nya ditutup."
+
+    await ctx.send(
+        f"✅ HWID `{hwid}` verified for {display_name}!\n"
+        f"⏰ Expiry: **{expiry_days} days** "
+        f"({expiry_date.strftime('%Y-%m-%d %H:%M WIB')})"
+        f"{dm_note}"
+    )
 
 
 @bot.command(name='extendhwid')
@@ -580,10 +615,18 @@ async def extend_hwid(ctx, user_input: str, additional_days: int):
             (new_expiry.isoformat(), user.id)
         )
         await db.commit()
-        await ctx.send(
-            f"✅ Extended {display_name}'s expiry by **{additional_days} days**!\n"
-            f"🆕 New expiry: `{new_expiry.strftime('%Y-%m-%d %H:%M WIB')}`"
-        )
+
+    # Kirim DM notifikasi perpanjangan
+    await safe_send_dm(
+        user,
+        f"🔄 HWID Anda telah diperpanjang **{additional_days} hari**!\n"
+        f"🆕 Expiry baru: `{new_expiry.strftime('%Y-%m-%d %H:%M WIB')}`"
+    )
+
+    await ctx.send(
+        f"✅ Extended {display_name}'s expiry by **{additional_days} days**!\n"
+        f"🆕 New expiry: `{new_expiry.strftime('%Y-%m-%d %H:%M WIB')}`"
+    )
 
 
 @bot.command(name='unverifyhwid')
@@ -603,6 +646,13 @@ async def unverify_hwid(ctx, user_input: str):
             (user.id,)
         )
         await db.commit()
+
+    # Kirim DM notifikasi unverify
+    await safe_send_dm(
+        user,
+        "❌ HWID Anda telah di-unverify. Hubungi admin jika ini salah."
+    )
+
     await ctx.send(f"✅ HWID unverified for {display_name}!")
 
 
@@ -685,8 +735,21 @@ async def clear_dm(ctx, user_input: str):
         return
 
     display_name = get_display_name(user)
-    dm_channel = user.dm_channel if user.dm_channel else await user.create_dm()
+
     await ctx.send(f"🧹 Sedang membersihkan DM bot dengan {display_name}...")
+
+    # Pastikan DM channel terbuka — buat kalau belum ada
+    try:
+        if user.dm_channel is None:
+            await user.create_dm()
+        dm_channel = user.dm_channel
+    except discord.Forbidden:
+        await ctx.send(f"❌ Tidak bisa mengakses DM {display_name} — user menutup DM dari bot.")
+        return
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Gagal membuka DM channel dengan {display_name}: `{e}`")
+        return
+
     deleted_count = 0
     try:
         async for message in dm_channel.history(limit=100):
@@ -694,12 +757,19 @@ async def clear_dm(ctx, user_input: str):
                 try:
                     await message.delete()
                     deleted_count += 1
-                    await asyncio.sleep(1)
-                except:
+                    await asyncio.sleep(0.5)
+                except discord.Forbidden:
+                    break
+                except discord.HTTPException:
                     pass
-        await ctx.send(f"✅ Berhasil menghapus **{deleted_count}** pesan bot di DM {display_name}.")
-    except:
-        await ctx.send(f"❌ Gagal mengakses DM {display_name}.")
+    except discord.Forbidden:
+        await ctx.send(f"❌ Tidak punya akses untuk membaca/menghapus pesan di DM {display_name}.")
+        return
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Gagal membaca history DM {display_name}: `{e}`")
+        return
+
+    await ctx.send(f"✅ Berhasil menghapus **{deleted_count}** pesan bot di DM {display_name}.")
 
 
 # ===== VOICE COMMANDS =====
